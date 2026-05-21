@@ -46,14 +46,12 @@ export function LecturerDashboardPage() {
     ? [
         { title: "Lớp học phần", value: String(summary.course_class_count) },
         { title: "Sinh viên (đang ghi danh)", value: String(summary.managed_student_count) },
-        { title: "Buổi học / điểm danh", value: String(summary.session_count) },
-        { title: "Ghi chú", value: "Dữ liệu từ PostgreSQL" }
+        { title: "Buổi học / điểm danh", value: String(summary.session_count) }
       ]
     : [
         { title: "Lớp học phần", value: "…" },
         { title: "Sinh viên", value: "…" },
-        { title: "Buổi học", value: "…" },
-        { title: "Trạng thái", value: err ? "Lỗi" : "Đang tải" }
+        { title: "Buổi học", value: "…" }
       ];
 
   return (
@@ -74,20 +72,38 @@ export function LecturerDashboardPage() {
 export function LecturerClassesPage() {
   const [rows, setRows] = useState([]);
   const [err, setErr] = useState("");
+  const [msg, setMsg] = useState("");
+  const [creating, setCreating] = useState(false);
+  const [form, setForm] = useState({
+    class_code: "",
+    class_name: "",
+    subject_code: "",
+    subject_name: "",
+    credits: 3,
+    semester: "HK2",
+    school_year: "2025-2026",
+    room: "",
+    description: ""
+  });
+
+  async function loadClasses(cancelled) {
+    const data = await apiFetch("/api/lecturer/course-classes");
+    if (cancelled) return;
+    const table = (data || []).map((r) => [
+      r.class_code ?? "",
+      r.subject_name ?? "",
+      r.class_name ?? "",
+      String(r.student_count ?? 0),
+      `${r.semester ?? ""} ${r.school_year ?? ""}`.trim()
+    ]);
+    setRows(table);
+  }
 
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
-        const data = await apiFetch("/api/lecturer/course-classes");
-        const table = (data || []).map((r) => [
-          r.class_code ?? "",
-          r.subject_name ?? "",
-          r.class_name ?? "",
-          String(r.student_count ?? 0),
-          `${r.semester ?? ""} ${r.school_year ?? ""}`.trim()
-        ]);
-        if (!cancelled) setRows(table);
+        await loadClasses(cancelled);
       } catch (e) {
         if (!cancelled) setErr(e.message);
       }
@@ -98,12 +114,270 @@ export function LecturerClassesPage() {
   }, []);
 
   return (
-    <PageBlock title="Danh sách lớp học phần">
+    <PageBlock title="Lớp học phần">
       {err ? <p className="hint api-error">{err}</p> : null}
+      {msg ? <p className="hint password-success">{msg}</p> : null}
+
+      <h4 className="subpanel-title">Tạo lớp mới</h4>
+      <p className="hint">
+        Sau khi tạo, sinh viên có thể tìm lớp và gửi yêu cầu tham gia; bạn duyệt tại mục &quot;Yêu cầu tham gia lớp&quot;.
+      </p>
+      <div className="form-grid">
+        <label>
+          Mã lớp HP *
+          <input
+            value={form.class_code}
+            onChange={(e) => setForm((f) => ({ ...f, class_code: e.target.value }))}
+            placeholder="VD: 13094"
+          />
+        </label>
+        <label>
+          Tên lớp HP
+          <input
+            value={form.class_name}
+            onChange={(e) => setForm((f) => ({ ...f, class_name: e.target.value }))}
+            placeholder="Tùy chọn"
+          />
+        </label>
+        <label>
+          Mã học phần *
+          <input
+            value={form.subject_code}
+            onChange={(e) => setForm((f) => ({ ...f, subject_code: e.target.value }))}
+            placeholder="VD: INT1481"
+          />
+        </label>
+        <label>
+          Tên học phần *
+          <input
+            value={form.subject_name}
+            onChange={(e) => setForm((f) => ({ ...f, subject_name: e.target.value }))}
+            placeholder="Dùng khi tạo học phần mới"
+          />
+        </label>
+        <label>
+          Số tín chỉ
+          <input
+            type="number"
+            min={0}
+            max={30}
+            value={form.credits}
+            onChange={(e) => setForm((f) => ({ ...f, credits: Number(e.target.value) || 0 }))}
+          />
+        </label>
+        <label>
+          Học kỳ *
+          <select
+            value={form.semester}
+            onChange={(e) => setForm((f) => ({ ...f, semester: e.target.value }))}
+          >
+            <option value="HK1">HK1</option>
+            <option value="HK2">HK2</option>
+            <option value="HK_HE">HK hè</option>
+          </select>
+        </label>
+        <label>
+          Năm học *
+          <input
+            value={form.school_year}
+            onChange={(e) => setForm((f) => ({ ...f, school_year: e.target.value }))}
+            placeholder="2025-2026"
+          />
+        </label>
+        <label>
+          Phòng
+          <input
+            value={form.room}
+            onChange={(e) => setForm((f) => ({ ...f, room: e.target.value }))}
+          />
+        </label>
+        <label className="full-width">
+          Mô tả
+          <input
+            value={form.description}
+            onChange={(e) => setForm((f) => ({ ...f, description: e.target.value }))}
+          />
+        </label>
+      </div>
+      <div className="actions">
+        <button
+          type="button"
+          className="primary"
+          disabled={creating}
+          onClick={async () => {
+            setErr("");
+            setMsg("");
+            if (!form.class_code.trim() || !form.subject_code.trim() || !form.subject_name.trim()) {
+              setErr("Nhập đủ mã lớp, mã học phần và tên học phần.");
+              return;
+            }
+            setCreating(true);
+            try {
+              await apiFetch("/api/lecturer/course-classes", {
+                method: "POST",
+                body: JSON.stringify({
+                  class_code: form.class_code.trim(),
+                  class_name: form.class_name.trim() || null,
+                  subject_code: form.subject_code.trim(),
+                  subject_name: form.subject_name.trim(),
+                  credits: form.credits,
+                  semester: form.semester,
+                  school_year: form.school_year.trim(),
+                  room: form.room.trim() || null,
+                  description: form.description.trim() || null
+                })
+              });
+              setMsg("Đã tạo lớp học phần.");
+              await loadClasses(false);
+            } catch (e) {
+              setErr(e.message);
+            } finally {
+              setCreating(false);
+            }
+          }}
+        >
+          {creating ? "Đang tạo..." : "Tạo lớp"}
+        </button>
+      </div>
+
+      <h4 className="subpanel-title">Danh sách lớp đang phụ trách</h4>
       <DataTable
         headers={["Mã lớp", "Môn học", "Tên lớp HP", "Sĩ số", "Học kỳ / năm"]}
         rows={rows}
       />
+    </PageBlock>
+  );
+}
+
+export function LecturerClassJoinRequestsPage() {
+  const [items, setItems] = useState([]);
+  const [err, setErr] = useState("");
+  const [statusFilter, setStatusFilter] = useState("");
+  const [busyId, setBusyId] = useState("");
+
+  async function load() {
+    const q = statusFilter ? `?status=${encodeURIComponent(statusFilter)}` : "";
+    const data = await apiFetch(`/api/lecturer/course-class-join-requests${q}`);
+    setItems(data || []);
+  }
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const q = statusFilter ? `?status=${encodeURIComponent(statusFilter)}` : "";
+        const data = await apiFetch(`/api/lecturer/course-class-join-requests${q}`);
+        if (!cancelled) setItems(data || []);
+      } catch (e) {
+        if (!cancelled) setErr(e.message);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [statusFilter]);
+
+  async function decide(id, decision) {
+    const note =
+      decision === "REJECTED"
+        ? window.prompt("Ghi chú từ chối (tùy chọn, Enter để bỏ qua)") ?? ""
+        : "";
+    setBusyId(String(id));
+    setErr("");
+    try {
+      await apiFetch(`/api/lecturer/course-class-join-requests/${id}/decision`, {
+        method: "POST",
+        body: JSON.stringify({
+          decision,
+          lecturer_note: note.trim() || null
+        })
+      });
+      await load();
+    } catch (e) {
+      setErr(e.message);
+    } finally {
+      setBusyId("");
+    }
+  }
+
+  return (
+    <PageBlock title="Yêu cầu tham gia lớp">
+      {err ? <p className="hint api-error">{err}</p> : null}
+      <div className="actions">
+        <select
+          value={statusFilter}
+          onChange={(e) => setStatusFilter(e.target.value)}
+          aria-label="Lọc trạng thái"
+        >
+          <option value="">Tất cả trạng thái</option>
+          <option value="PENDING">Đang chờ</option>
+          <option value="APPROVED">Đã chấp nhận</option>
+          <option value="REJECTED">Đã từ chối</option>
+          <option value="CANCELLED">Sinh viên đã hủy</option>
+        </select>
+        <button type="button" onClick={() => load()}>
+          Làm mới
+        </button>
+      </div>
+      <div className="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Trạng thái</th>
+              <th>Mã lớp / môn</th>
+              <th>Sinh viên</th>
+              <th>Lời nhắn SV</th>
+              <th>Ghi chú GV</th>
+              <th>Thời gian</th>
+              <th>Thao tác</th>
+            </tr>
+          </thead>
+          <tbody>
+            {items.map((r) => (
+              <tr key={r.id}>
+                <td>{r.status}</td>
+                <td>
+                  {r.class_code} — {r.subject_name}
+                  <div className="hint">{r.subject_code}</div>
+                </td>
+                <td>
+                  {r.student_code} — {r.full_name}
+                  <div className="hint">{r.administrative_class ?? ""}</div>
+                </td>
+                <td>{r.message ?? "—"}</td>
+                <td>{r.lecturer_note ?? "—"}</td>
+                <td>
+                  <span className="hint">{String(r.created_at ?? "").slice(0, 19)}</span>
+                </td>
+                <td>
+                  {r.status === "PENDING" ? (
+                    <div className="inline-actions">
+                      <button
+                        type="button"
+                        className="primary"
+                        disabled={busyId === String(r.id)}
+                        onClick={() => decide(r.id, "APPROVED")}
+                      >
+                        Chấp nhận
+                      </button>
+                      <button
+                        type="button"
+                        disabled={busyId === String(r.id)}
+                        onClick={() => decide(r.id, "REJECTED")}
+                      >
+                        Từ chối
+                      </button>
+                    </div>
+                  ) : (
+                    "—"
+                  )}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      {!items.length ? <p className="hint">Chưa có yêu cầu.</p> : null}
     </PageBlock>
   );
 }
@@ -479,7 +753,7 @@ export function LecturerLiveAttendancePage() {
         const fd = new FormData();
         fd.append("file", blob, "frame.jpg");
         const rec = await apiFetch(
-          `/api/recognize/realtime-frame?session_id=${encodeURIComponent(sessionId)}&threshold=0.85`,
+          `/api/recognize/realtime-frame?session_id=${encodeURIComponent(sessionId)}&threshold=0.9`,
           { method: "POST", body: fd }
         );
         setLatest(rec);
@@ -635,7 +909,7 @@ export function LecturerLiveAttendancePage() {
           </p>
           <p className="hint">
             Hệ thống chỉ xác nhận điểm danh khi cùng một sinh viên được nhận diện liên tiếp đủ 4 lần với score &gt;=
-            0.85.
+            0.9.
           </p>
         </div>
         <div>
@@ -901,16 +1175,308 @@ export function LecturerReviewRequestsPage() {
   );
 }
 
+const reportHeaders = [
+  "Mã lớp",
+  "Môn học",
+  "Ngày",
+  "Ca học",
+  "Mã SV",
+  "Họ tên",
+  "Lớp hành chính",
+  "Trạng thái",
+  "Nguồn",
+  "Time xác nhận",
+  "Time cuối cùng thấy",
+  "Thời gian hiện diện",
+  "Điểm tương đồng",
+  "Ghi chú"
+];
+
+function reportClockTime(value) {
+  if (!value) return "—";
+  const text = String(value);
+  const match = text.match(/T(\d{2}:\d{2}:\d{2})/);
+  if (match) return match[1];
+  return text.slice(0, 8);
+}
+
+function reportDuration(seconds) {
+  const s = Math.max(0, Number(seconds) || 0);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = Math.floor(s % 60);
+  const pad = (v) => String(v).padStart(2, "0");
+  return `${pad(h)}:${pad(m)}:${pad(sec)}`;
+}
+
+function reportRowsForExport(report) {
+  const classInfo = report?.class_info || {};
+  return (report?.rows || []).map((r) => [
+    classInfo.class_code ?? "",
+    classInfo.subject_name ?? "",
+    r.session_date ?? "",
+    `${String(r.start_time ?? "").slice(0, 5)}-${String(r.end_time ?? "").slice(0, 5)}`,
+    r.student_code ?? "",
+    r.full_name ?? "",
+    r.administrative_class ?? "",
+    r.attendance_status ?? "ABSENT",
+    r.source ?? "—",
+    reportClockTime(r.check_in_time),
+    reportClockTime(r.last_seen_at),
+    reportDuration(r.total_seen_seconds),
+    r.similarity_score != null ? Number(r.similarity_score).toFixed(3) : "—",
+    r.note ?? ""
+  ]);
+}
+
+function downloadTextFile(filename, content, type) {
+  const blob = new Blob([content], { type });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
+function escapeCsvCell(value) {
+  const text = String(value ?? "");
+  return `"${text.replace(/"/g, '""')}"`;
+}
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function reportFileBase(report) {
+  const classCode = report?.class_info?.class_code || "lop";
+  const today = getTodayDateString();
+  return `bao-cao-diem-danh-${classCode}-${today}`;
+}
+
+function exportReportCsv(report) {
+  const rows = reportRowsForExport(report);
+  const content = [reportHeaders, ...rows].map((row) => row.map(escapeCsvCell).join(",")).join("\n");
+  downloadTextFile(`${reportFileBase(report)}.csv`, `\ufeff${content}`, "text/csv;charset=utf-8");
+}
+
+function buildReportHtml(report) {
+  const classInfo = report?.class_info || {};
+  const summary = report?.summary || {};
+  const rows = reportRowsForExport(report);
+  const byStatus = summary.by_status || {};
+  return `<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Báo cáo điểm danh ${escapeHtml(classInfo.class_code || "")}</title>
+  <style>
+    body { font-family: Arial, sans-serif; color: #0f172a; }
+    h1 { font-size: 20px; margin-bottom: 4px; }
+    p { margin: 4px 0; }
+    table { width: 100%; border-collapse: collapse; margin-top: 16px; font-size: 12px; }
+    th, td { border: 1px solid #cbd5e1; padding: 6px; text-align: left; }
+    th { background: #e2e8f0; }
+  </style>
+</head>
+<body>
+  <h1>Báo cáo điểm danh</h1>
+  <p><strong>Lớp:</strong> ${escapeHtml(classInfo.class_code)} - ${escapeHtml(classInfo.subject_name)}</p>
+  <p><strong>Tên lớp:</strong> ${escapeHtml(classInfo.class_name || "")}</p>
+  <p><strong>Số buổi:</strong> ${summary.session_count ?? 0} | <strong>Sĩ số:</strong> ${summary.student_count ?? 0} | <strong>Present:</strong> ${byStatus.PRESENT ?? 0} | <strong>Absent:</strong> ${byStatus.ABSENT ?? 0}</p>
+  <table>
+    <thead><tr>${reportHeaders.map((h) => `<th>${escapeHtml(h)}</th>`).join("")}</tr></thead>
+    <tbody>
+      ${rows.map((row) => `<tr>${row.map((cell) => `<td>${escapeHtml(cell)}</td>`).join("")}</tr>`).join("")}
+    </tbody>
+  </table>
+</body>
+</html>`;
+}
+
+function exportReportExcel(report) {
+  downloadTextFile(
+    `${reportFileBase(report)}.xls`,
+    buildReportHtml(report),
+    "application/vnd.ms-excel;charset=utf-8"
+  );
+}
+
+function exportReportPdf(report) {
+  const win = window.open("", "_blank");
+  if (!win) return;
+  win.document.write(buildReportHtml(report));
+  win.document.close();
+  win.focus();
+  win.print();
+}
+
 export function LecturerReportsPage() {
+  const [classes, setClasses] = useState([]);
+  const [classCode, setClassCode] = useState("");
+  const [fromDate, setFromDate] = useState("");
+  const [toDate, setToDate] = useState("");
+  const [report, setReport] = useState(null);
+  const [err, setErr] = useState("");
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const data = await apiFetch("/api/lecturer/course-classes");
+        if (!cancelled) setClasses(data || []);
+      } catch (e) {
+        if (!cancelled) setErr(e.message);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  async function loadReport() {
+    if (!classCode) {
+      setErr("Vui lòng chọn lớp học phần trước khi xuất báo cáo.");
+      return;
+    }
+    setErr("");
+    setLoading(true);
+    try {
+      const q = new URLSearchParams({ class_code: classCode });
+      if (fromDate) q.set("from_date", fromDate);
+      if (toDate) q.set("to_date", toDate);
+      const data = await apiFetch(`/api/lecturer/reports/attendance?${q.toString()}`);
+      setReport(data);
+    } catch (e) {
+      setErr(e.message);
+      setReport(null);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  const rows = reportRowsForExport(report).slice(0, 100);
+  const summary = report?.summary || {};
+  const byStatus = summary.by_status || {};
+  const canExport = Boolean(report && report.rows?.length);
+
   return (
     <PageBlock title="Báo cáo điểm danh">
-      <div className="actions">
-        <button type="button" className="primary">
-          Xuất Excel
-        </button>
-        <button type="button">Xuất CSV</button>
-        <button type="button">Xuất PDF</button>
+      {err ? <p className="hint api-error">{err}</p> : null}
+      <p className="hint report-intro">
+        Chọn lớp học phần trước, sau đó tải dữ liệu và xuất file theo định dạng cần dùng.
+      </p>
+
+      <div className="report-card">
+        <div className="report-filters-grid">
+          <div className="report-field report-field--class">
+            <label htmlFor="report-class-select">Lớp học phần</label>
+            <select
+              id="report-class-select"
+              value={classCode}
+              onChange={(e) => {
+                setClassCode(e.target.value);
+                setReport(null);
+              }}
+              aria-label="Chọn lớp học phần để xuất báo cáo"
+            >
+              <option value="">Chọn lớp cần xuất</option>
+              {classes.map((c) => (
+                <option key={c.id} value={c.class_code}>
+                  {c.class_code} — {c.subject_name}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="report-field">
+            <label htmlFor="report-from-date">Ngày bắt đầu</label>
+            <input
+              id="report-from-date"
+              type="date"
+              value={fromDate}
+              onChange={(e) => setFromDate(e.target.value)}
+              aria-label="Ngày bắt đầu"
+            />
+          </div>
+          <div className="report-field">
+            <label htmlFor="report-to-date">Ngày kết thúc</label>
+            <input
+              id="report-to-date"
+              type="date"
+              value={toDate}
+              onChange={(e) => setToDate(e.target.value)}
+              aria-label="Ngày kết thúc"
+            />
+          </div>
+          <div className="report-field report-field--actions">
+            <span className="report-actions-spacer" aria-hidden="true" />
+            <button
+              id="report-load-btn"
+              type="button"
+              className="report-load-btn"
+              disabled={loading}
+              onClick={loadReport}
+              aria-label="Tải dữ liệu báo cáo điểm danh"
+            >
+              {loading ? "Đang tải…" : "Tải báo cáo"}
+            </button>
+          </div>
+        </div>
+
+        <div className="report-export-bar">
+          <span className="report-export-title">Xuất file</span>
+          <div className="report-export-buttons">
+            <button
+              type="button"
+              className="report-export-btn report-export-btn--excel"
+              disabled={!canExport}
+              onClick={() => exportReportExcel(report)}
+            >
+              Xuất Excel
+            </button>
+            <button
+              type="button"
+              className="report-export-btn report-export-btn--csv"
+              disabled={!canExport}
+              onClick={() => exportReportCsv(report)}
+            >
+              Xuất CSV
+            </button>
+            <button
+              type="button"
+              className="report-export-btn report-export-btn--pdf"
+              disabled={!canExport}
+              onClick={() => exportReportPdf(report)}
+            >
+              Xuất PDF
+            </button>
+          </div>
+        </div>
       </div>
+
+      {report ? (
+        <div className="report-summary">
+          <span>Số buổi: <strong>{summary.session_count ?? 0}</strong></span>
+          <span>Sĩ số: <strong>{summary.student_count ?? 0}</strong></span>
+          <span>Có mặt: <strong>{byStatus.PRESENT ?? 0}</strong></span>
+          <span>Vắng: <strong>{byStatus.ABSENT ?? 0}</strong></span>
+          <span>Tổng dòng: <strong>{summary.total_rows ?? 0}</strong></span>
+        </div>
+      ) : null}
+
+      {report ? (
+        <>
+          <p className="hint report-preview-hint">Xem trước tối đa 100 dòng đầu tiên trước khi xuất file.</p>
+          <DataTable headers={reportHeaders} rows={rows} />
+        </>
+      ) : null}
     </PageBlock>
   );
 }

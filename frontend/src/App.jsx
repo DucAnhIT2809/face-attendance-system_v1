@@ -4,6 +4,7 @@ import { RequireRole } from "./components/RequireRole";
 import { LoginPage } from "./pages/LoginPage";
 import {
   LecturerAttendancePage,
+  LecturerClassJoinRequestsPage,
   LecturerClassesPage,
   LecturerDashboardPage,
   LecturerLiveAttendancePage,
@@ -16,6 +17,7 @@ import {
   StudentDashboardPage,
   StudentFacePage,
   StudentHistoryPage,
+  StudentJoinClassesPage,
   StudentInfoPage,
   StudentNotificationsPage,
   StudentReviewPage
@@ -38,6 +40,7 @@ function App() {
         <Route index element={<Navigate to="dashboard" replace />} />
         <Route path="dashboard" element={<LecturerDashboardPage />} />
         <Route path="classes" element={<LecturerClassesPage />} />
+        <Route path="class-join-requests" element={<LecturerClassJoinRequestsPage />} />
         <Route path="students" element={<LecturerStudentsPage />} />
         <Route path="sessions" element={<LecturerSessionsPage />} />
         <Route path="live-attendance" element={<LecturerLiveAttendancePage />} />
@@ -56,6 +59,7 @@ function App() {
       >
         <Route index element={<Navigate to="dashboard" replace />} />
         <Route path="dashboard" element={<StudentDashboardPage />} />
+        <Route path="join-classes" element={<StudentJoinClassesPage />} />
         <Route path="profile" element={<StudentInfoPage />} />
         <Route path="face-images" element={<StudentFacePage />} />
         <Route path="attendance-history" element={<StudentHistoryPage />} />

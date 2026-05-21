@@ -6,3 +6,9 @@ pydantic-settings>=2.6.0
 PyJWT>=2.9.0
 bcrypt>=4.2.0
 python-multipart>=0.0.12
+boto3>=1.35.0
+# Nhận diện / cập nhật embedding sau upload ảnh (ArcFace + YOLO trong tiến trình backend)
+torch>=2.1.0
+torchvision>=0.16.0
+ultralytics>=8.1.0
+Pillow>=10.0.0

@@ -1,6 +1,7 @@
 export const lecturerMenu = [
   { label: "Dashboard", to: "/lecturer/dashboard" },
   { label: "Lớp học phần", to: "/lecturer/classes" },
+  { label: "Yêu cầu tham gia lớp", to: "/lecturer/class-join-requests" },
   { label: "Sinh viên", to: "/lecturer/students" },
   { label: "Buổi học", to: "/lecturer/sessions" },
   { label: "Điểm danh trực tiếp", to: "/lecturer/live-attendance" },
@@ -11,6 +12,7 @@ export const lecturerMenu = [
 
 export const studentMenu = [
   { label: "Dashboard", to: "/student/dashboard" },
+  { label: "Tham gia lớp", to: "/student/join-classes" },
   { label: "Thông tin cá nhân", to: "/student/profile" },
   { label: "Ảnh khuôn mặt", to: "/student/face-images" },
   { label: "Lịch sử điểm danh", to: "/student/attendance-history" },

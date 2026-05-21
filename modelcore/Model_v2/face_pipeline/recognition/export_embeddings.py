@@ -9,7 +9,15 @@ from typing import Dict, List
 import torch
 from PIL import Image
 
-from arcface_train import ArcFaceBackbone, FaceDetector, IMAGE_EXTENSIONS, build_transform, resolve_device, resolve_model_path
+from face_pipeline.paths import MODEL_DIR, REPO_ROOT
+from face_pipeline.recognition.arcface_train import (
+    ArcFaceBackbone,
+    FaceDetector,
+    IMAGE_EXTENSIONS,
+    build_transform,
+    resolve_device,
+    resolve_model_path,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -18,21 +26,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--gallery-dir",
         type=str,
-        default="TrainingAugmented",
+        default=str(REPO_ROOT / "TrainingAugmented"),
         help="Folder with structure: gallery_dir/<person_name>/*.jpg",
     )
     parser.add_argument(
         "--output-db",
         type=str,
         default=None,
-        help="Output embedding database file (.pt).",
+        help="Output embedding database file (.pt). If omitted, use --class-code path or default face_db.pt.",
     )
-    parser.add_argument("--class-code", type=str, default=None, help="Export to a class-specific face_db path.")
+    parser.add_argument("--class-code", type=str, default=None, help="Export to <class-output-root>/<class_code>/face_db.pt.")
     parser.add_argument(
         "--class-output-root",
         type=str,
-        default="arcface_runs/classes",
-        help="Root folder for class exports: <root>/<class_code>/face_db.pt.",
+        default=str(MODEL_DIR / "arcface_runs" / "classes"),
+        help="Root for class-specific exports when --class-code is set.",
     )
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument(
@@ -44,7 +52,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--face-detector-weight",
         type=str,
-        default="yolov8n-face.pt",
+        default="yolov8s-face.pt",
         help="Path to YOLO face detector weight used for pre-cropping.",
     )
     parser.add_argument(
@@ -146,7 +154,7 @@ def main() -> None:
     elif args.class_code:
         output_path = (Path(args.class_output_root) / args.class_code / "face_db.pt").resolve()
     else:
-        output_path = Path("arcface_runs/face_db.pt").resolve()
+        output_path = (MODEL_DIR / "arcface_runs" / "face_db.pt").resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {

@@ -32,6 +32,7 @@ uploads/
 *.npy
 *.npz
 modelcore/Model/arcface_runs/
+modelcore/Model_v2/arcface_runs/
 modelcore/Training/
 modelcore/TrainingAugmented/
 

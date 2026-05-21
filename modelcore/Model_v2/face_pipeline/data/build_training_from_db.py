@@ -11,6 +11,14 @@ from pathlib import Path
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
+from face_pipeline.data.pg_settings import (
+    DEFAULT_PG_DBNAME,
+    DEFAULT_PG_USER,
+    default_pg_password,
+    connect_pg,
+)
+from face_pipeline.paths import REPO_ROOT
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -18,12 +26,22 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--db-host", type=str, default="localhost")
     parser.add_argument("--db-port", type=int, default=5432)
-    parser.add_argument("--db-name", type=str, default=None)
-    parser.add_argument("--db-user", type=str, default=None)
-    parser.add_argument("--db-password", type=str, default=None)
-    parser.add_argument("--database-url", type=str, default=None)
-    parser.add_argument("--class-code", type=str, default=None, help="Optional class filter.")
-    parser.add_argument("--output-dir", type=str, default="TrainingSelected")
+    parser.add_argument("--db-name", type=str, default=DEFAULT_PG_DBNAME)
+    parser.add_argument("--db-user", type=str, default=DEFAULT_PG_USER)
+    parser.add_argument("--db-password", type=str, default=default_pg_password())
+    parser.add_argument(
+        "--database-url",
+        type=str,
+        default=None,
+        help="Full PostgreSQL URL (overrides --db-* when set).",
+    )
+    parser.add_argument("--class-code", type=str, default=None, help="Optional course class filter (cc.class_code).")
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=str(REPO_ROOT / "TrainingSelected"),
+        help="Output root: one subfolder per student_code.",
+    )
     parser.add_argument(
         "--link-mode",
         choices=["copy", "symlink"],
@@ -34,7 +52,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--include-pending",
         action="store_true",
-        help="Also include PENDING uploaded images. Useful before adding a lecturer image review flow.",
+        help="Also include PENDING uploaded images.",
     )
     return parser.parse_args()
 
@@ -59,7 +77,7 @@ def fetch_training_images(conn, class_code: str | None, include_pending: bool) -
         sfi.status = 'VALID'
         OR sfi.is_used_for_training = TRUE
     """
-    params = []
+    params: list[str] = []
     if include_pending:
         query += " OR sfi.status = 'PENDING'"
     query += ")"
@@ -81,7 +99,7 @@ def fetch_legacy_face_folders(conn, class_code: str | None) -> list[dict]:
     WHERE st.status = 'ACTIVE'
       AND st.face_folder IS NOT NULL
     """
-    params = []
+    params: list[str] = []
     if class_code:
         query += " AND cc.class_code = %s"
         params.append(class_code)
@@ -147,18 +165,22 @@ def collect_images(face_folder: Path) -> list[Path]:
 
 def main() -> None:
     args = parse_args()
-    if not args.database_url and not (args.db_name and args.db_user and args.db_password):
-        raise ValueError("Provide --database-url or --db-name/--db-user/--db-password.")
+    if not args.database_url and not (args.db_name and args.db_user):
+        raise ValueError("Provide --database-url or --db-name and --db-user (and optional --db-password).")
+
     output_dir = Path(args.output_dir).resolve()
     reset_output(output_dir, overwrite=args.overwrite)
 
-    conn = psycopg2.connect(args.database_url) if args.database_url else psycopg2.connect(
-        host=args.db_host,
-        port=args.db_port,
-        dbname=args.db_name,
-        user=args.db_user,
-        password=args.db_password,
-    )
+    if args.database_url:
+        conn = psycopg2.connect(args.database_url)
+    else:
+        conn = connect_pg(
+            host=args.db_host,
+            port=args.db_port,
+            dbname=args.db_name,
+            user=args.db_user,
+            password=args.db_password,
+        )
     try:
         image_rows = fetch_training_images(conn, args.class_code, args.include_pending)
         legacy_folders = fetch_legacy_face_folders(conn, args.class_code)

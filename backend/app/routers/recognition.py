@@ -16,15 +16,17 @@ from app.deps import get_lecturer_context
 router = APIRouter(prefix="/recognize", tags=["recognition"])
 
 CONFIRM_HITS_REQUIRED = 4
-MIN_SCORE_REQUIRED = 0.85
+MIN_SCORE_REQUIRED = 0.9
 TRACK_IOU_THRESHOLD = 0.35
 TRACK_TTL_FRAMES = 6
-_RECOGNIZER: "InProcessRecognizer | None" = None
+# Giữa hai lần nhận diện hợp lệ liên tiếp, không cộng quá N giây (tránh bù giờ khi camera/người dùng tạm ngắt lâu).
+MAX_PRESENCE_STEP_SECONDS = 120
+_RECOGNIZERS: dict[str, "InProcessRecognizer"] = {}
 _RECOGNIZER_LOCK = threading.Lock()
 
 # Runtime tracking state (in-memory)
 # Dùng nội bộ cho confirm điểm danh + theo dõi thời gian hiện diện trong lớp.
-# { session_id: { student_id: {hits, confirmed, last_score, last_seen, presence_seconds, student_code, full_name} } }
+# { session_id: { student_id: {hits, confirmed, last_score, last_seen, last_presence_at, presence_seconds, ...} } }
 TRACKING_STATE: dict[str, dict[str, dict]] = {}
 # { session_id: { track_id: {box, misses, identity, score, student, face_box} } }
 LIVE_FACE_TRACKS: dict[str, dict[str, dict]] = {}
@@ -57,15 +59,15 @@ def _box_iou(a: dict[str, Any], b: dict[str, Any]) -> float:
 
 
 class InProcessRecognizer:
-    def __init__(self) -> None:
+    def __init__(self, embedding_db_path: Path | None = None) -> None:
         settings = get_settings()
         if not settings.modelcore_root or not settings.arcface_checkpoint or not settings.face_embedding_db:
             raise HTTPException(
                 status_code=503,
-                detail="Chưa cấu hình MODELCORE_ROOT / ARCFACE_CHECKPOINT / FACE_EMBEDDING_DB trong .env",
+                detail="Chưa cấu hình MODELCORE_ROOT / ARCFACE_CHECKPOINT / FACE_EMBEDDING_DB trong .env (tuỳ chọn: MODELCORE_MODEL_DIR, mặc định Model_v2)",
             )
 
-        model_dir = Path(settings.modelcore_root) / "Model"
+        model_dir = Path(settings.modelcore_root) / settings.modelcore_model_dir
         if not model_dir.is_dir():
             raise HTTPException(status_code=500, detail=f"Không tìm thấy thư mục model: {model_dir}")
         model_dir_str = str(model_dir.resolve())
@@ -74,18 +76,20 @@ class InProcessRecognizer:
 
         try:
             import torch
-            from arcface_train import FaceDetector, build_transform, resolve_device, resolve_model_path
-            from recognize_face import load_backbone, load_embedding_db, predict_identity
+            from face_pipeline.recognition.arcface_train import FaceDetector, build_transform, resolve_device, resolve_model_path
+            from face_pipeline.recognition.recognize_face import load_backbone, load_embedding_db, predict_identity
         except Exception as exc:
             raise HTTPException(status_code=500, detail=f"Không import được model trong backend: {exc}") from exc
 
         self.torch = torch
         self.predict_identity = predict_identity
         self.device = resolve_device("auto")
+        selected_embedding_db = embedding_db_path or Path(settings.face_embedding_db).resolve()
+        self.embedding_db_path = selected_embedding_db
         self.backbone, self.image_size = load_backbone(Path(settings.arcface_checkpoint).resolve(), self.device)
-        self.person_embeddings = load_embedding_db(Path(settings.face_embedding_db).resolve())
+        self.person_embeddings = load_embedding_db(selected_embedding_db)
         self.transform = build_transform(image_size=self.image_size, train=False)
-        self.face_detector = FaceDetector(resolve_model_path("yolov8n-face.pt"), conf=0.25)
+        self.face_detector = FaceDetector(resolve_model_path("yolov8s-face.pt"), conf=0.25)
         self.inference_lock = threading.Lock()
 
     def _recognize_crop(
@@ -197,13 +201,44 @@ class InProcessRecognizer:
         return raw_out, identity, score, face_box, faces
 
 
-def _get_recognizer() -> InProcessRecognizer:
-    global _RECOGNIZER
-    if _RECOGNIZER is None:
+def _get_recognizer(embedding_db_path: Path | None = None) -> InProcessRecognizer:
+    settings = get_settings()
+    selected_path = (embedding_db_path or Path(settings.face_embedding_db)).resolve()
+    cache_key = str(selected_path)
+    if cache_key not in _RECOGNIZERS:
         with _RECOGNIZER_LOCK:
-            if _RECOGNIZER is None:
-                _RECOGNIZER = InProcessRecognizer()
-    return _RECOGNIZER
+            if cache_key not in _RECOGNIZERS:
+                _RECOGNIZERS[cache_key] = InProcessRecognizer(selected_path)
+    return _RECOGNIZERS[cache_key]
+
+
+def invalidate_recognizer_caches(paths: list[Path] | tuple[Path, ...]) -> None:
+    """Xóa recognizer đã cache để lần nhận diện sau đọc lại face_db.pt từ đĩa."""
+    resolved = {str(Path(p).resolve()) for p in paths if p is not None}
+    if not resolved:
+        return
+    with _RECOGNIZER_LOCK:
+        for key in resolved:
+            _RECOGNIZERS.pop(key, None)
+
+
+def _session_embedding_db_path(session_id: str, lecturer_id: str) -> tuple[Path | None, str | None]:
+    row = fetch_one(
+        """
+        SELECT cc.class_code
+        FROM class_sessions cs
+        JOIN course_classes cc ON cc.id = cs.course_class_id
+        WHERE cs.id = %s::uuid AND cc.lecturer_id = %s::uuid
+        """,
+        (session_id, lecturer_id),
+    )
+    if not row:
+        raise HTTPException(status_code=403, detail="Bạn không có quyền điểm danh buổi học này")
+
+    class_code = row["class_code"]
+    settings = get_settings()
+    class_db = (Path(settings.class_embedding_root) / class_code / "face_db.pt").resolve()
+    return (class_db if class_db.exists() else None), class_code
 
 
 def _resolve_student_by_identity(identity: str | None):
@@ -239,9 +274,9 @@ def _student_enrolled_in_session(student_id: str, session_id: str, lecturer_id: 
     )
 
 
-def _run_recognition(file_bytes: bytes, suffix: str, threshold: float):
+def _run_recognition(file_bytes: bytes, suffix: str, threshold: float, embedding_db_path: Path | None = None):
     try:
-        recognizer = _get_recognizer()
+        recognizer = _get_recognizer(embedding_db_path)
         return recognizer.recognize(file_bytes, threshold)
     except HTTPException:
         raise
@@ -262,6 +297,7 @@ def _record_face_hit(session_id: str, student: dict, score: float | None, thresh
             "confirmed": False,
             "last_score": None,
             "last_seen": None,
+            "last_presence_at": None,
             "presence_seconds": 0,
             "student_code": student["student_code"],
             "full_name": student["full_name"],
@@ -269,19 +305,29 @@ def _record_face_hit(session_id: str, student: dict, score: float | None, thresh
     )
 
     now = datetime.now(timezone.utc)
-    last_seen_raw = state.get("last_seen")
-    if last_seen_raw:
+    valid_hit = score is not None and score >= max(threshold, MIN_SCORE_REQUIRED)
+
+    # Chỉ tích lũy thời gian hiện diện khi nhận diện đạt ngưỡng (tránh cộng giờ khi score thấp / cache track cũ).
+    last_pres_raw = state.get("last_presence_at")
+    if last_pres_raw and valid_hit:
         try:
-            prev = datetime.fromisoformat(last_seen_raw)
+            prev = datetime.fromisoformat(last_pres_raw)
+            if prev.tzinfo is None:
+                prev = prev.replace(tzinfo=timezone.utc)
             delta = max(0, int((now - prev).total_seconds()))
+            delta = min(delta, MAX_PRESENCE_STEP_SECONDS)
             state["presence_seconds"] = int(state.get("presence_seconds", 0)) + delta
         except ValueError:
             pass
+    if valid_hit:
+        state["last_presence_at"] = now.isoformat()
+    elif not state.get("confirmed"):
+        # Chưa điểm danh: mất chuỗi khớp → không nối mốc thời gian (tránh cộng bù sau khoảng lặng dài).
+        state["last_presence_at"] = None
 
     if state.get("confirmed"):
         state["hits"] = CONFIRM_HITS_REQUIRED
     else:
-        valid_hit = score is not None and score >= max(threshold, MIN_SCORE_REQUIRED)
         state["hits"] = int(state.get("hits", 0)) + 1 if valid_hit else 0
 
     state["last_score"] = score
@@ -362,7 +408,7 @@ async def recognize_identity(
 ):
     """
     Nhận diện ảnh upload bằng model đã cache trong tiến trình backend.
-    Cần cấu hình MODELCORE_ROOT / ARCFACE_CHECKPOINT / FACE_EMBEDDING_DB trong .env
+    Cần cấu hình MODELCORE_ROOT / MODELCORE_MODEL_DIR (tuỳ chọn) / ARCFACE_CHECKPOINT / FACE_EMBEDDING_DB trong .env
     """
     suffix = Path(file.filename or "upload.jpg").suffix or ".jpg"
     data = await file.read()
@@ -392,7 +438,7 @@ async def recognize_realtime_frame(
     ctx: Annotated[dict, Depends(get_lecturer_context)],
     file: UploadFile = File(...),
     session_id: str = "",
-    threshold: float = 0.85,
+    threshold: float = 0.9,
 ):
     """
     Nhận 1 frame từ frontend, nhận diện và cập nhật attendance_records ngay lập tức.
@@ -405,7 +451,8 @@ async def recognize_realtime_frame(
         raise HTTPException(status_code=400, detail="File rỗng")
 
     started = time.perf_counter()
-    recognizer = _get_recognizer()
+    embedding_db_path, class_code = _session_embedding_db_path(session_id, str(ctx["lecturer_id"]))
+    recognizer = _get_recognizer(embedding_db_path)
     image, detected_faces = recognizer.detect_faces(data)
     tracks = LIVE_FACE_TRACKS.setdefault(session_id, {})
     for track in tracks.values():
@@ -512,6 +559,8 @@ async def recognize_realtime_frame(
         "candidate_student": primary.get("candidate_student"),
         "raw_stdout_tail": f"Detected faces: {len(detected_faces)}\nLive latency ms: {elapsed_ms:.1f}",
         "session_id": session_id,
+        "class_code": class_code,
+        "embedding_db": str(recognizer.embedding_db_path),
         "requested_by_lecturer_id": str(ctx["lecturer_id"]),
     }
 
@@ -574,7 +623,7 @@ def live_tracking(
     session_id: str = "",
 ):
     """
-    Trả trạng thái tích lũy nhận diện realtime (đủ 4 lần >= 0.85 mới xác nhận điểm danh).
+    Trả trạng thái tích lũy nhận diện realtime (đủ 4 lần >= 0.9 mới xác nhận điểm danh).
     """
     if not session_id:
         raise HTTPException(status_code=400, detail="Thiếu session_id")

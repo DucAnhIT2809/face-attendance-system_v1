@@ -10,9 +10,9 @@ from uuid import uuid4
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from pydantic import BaseModel, Field
 
-from app.config import get_settings
-from app.db import execute, execute_returning, fetch_all, rows_to_json_serializable
+from app.db import execute, execute_returning, fetch_all, fetch_one, rows_to_json_serializable
 from app.deps import get_student_context
+from app.storage import store_bytes
 
 router = APIRouter(prefix="/student", tags=["student"])
 
@@ -20,6 +20,11 @@ router = APIRouter(prefix="/student", tags=["student"])
 class CreateRecheckRequestBody(BaseModel):
     session_id: UUID
     reason: str = Field(min_length=3, max_length=1000)
+
+
+class CreateCourseClassJoinRequestBody(BaseModel):
+    course_class_id: UUID
+    message: str | None = Field(default=None, max_length=500)
 
 
 @router.get("/me")
@@ -93,18 +98,16 @@ async def upload_face_images(
     if not files:
         raise HTTPException(status_code=400, detail="Chưa chọn ảnh")
 
-    settings = get_settings()
-    upload_root = Path(settings.upload_root).resolve()
     student_code = ctx["student_code"]
-    target_dir = (upload_root / "students" / str(student_code)).resolve()
-    target_dir.mkdir(parents=True, exist_ok=True)
+    storage_prefix = f"students/{student_code}"
 
     execute(
         "UPDATE students SET face_folder = %s, updated_at = CURRENT_TIMESTAMP WHERE id = %s::uuid",
-        (str(target_dir), str(ctx["student_id"])),
+        (storage_prefix, str(ctx["student_id"])),
     )
 
     created: list[dict] = []
+    upload_blobs: list[bytes] = []
     now = datetime.now(timezone.utc)
     allowed_ext = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 
@@ -119,8 +122,11 @@ async def upload_face_images(
             raise HTTPException(status_code=400, detail="File quá lớn (tối đa 8MB)")
 
         name = f"{now.strftime('%Y%m%d_%H%M%S')}_{uuid4().hex}{suffix}"
-        file_path = (target_dir / name).resolve()
-        file_path.write_bytes(content)
+        stored = store_bytes(
+            key=f"{storage_prefix}/{name}",
+            content=content,
+            content_type=f.content_type,
+        )
 
         row = execute_returning(
             """
@@ -135,12 +141,25 @@ async def upload_face_images(
             RETURNING id, image_path, image_type::text AS image_type, status::text AS status,
                       is_used_for_training, uploaded_at, reviewed_at
             """,
-            (str(ctx["student_id"]), str(file_path), str(ctx["id"]), now),
+            (str(ctx["student_id"]), stored.uri, str(ctx["id"]), now),
         )
         if row:
             created.append(row)
+            upload_blobs.append(content)
 
-    return rows_to_json_serializable(created)
+    created_json = rows_to_json_serializable(created)
+    emb_meta: dict = {"ok": False, "skipped": True, "reason": "no_stored_images"}
+    if upload_blobs and created:
+        from app.embedding_incremental import merge_embeddings_after_face_upload
+
+        emb_meta = merge_embeddings_after_face_upload(
+            student_id=str(ctx["student_id"]),
+            student_code=student_code,
+            image_contents=upload_blobs,
+            created_image_ids=[str(r["id"]) for r in created],
+        )
+
+    return {"created": created_json, "embedding_update": emb_meta}
 
 
 @router.get("/attendance-history")
@@ -304,4 +323,150 @@ def create_student_recheck_request(
             body.reason.strip(),
         ),
     )
+    return rows_to_json_serializable([row])[0]
+
+
+@router.get("/course-classes/search")
+def student_search_course_classes(
+    ctx: Annotated[dict, Depends(get_student_context)],
+    q: str = Query("", min_length=1, max_length=200),
+    limit: int = Query(40, ge=1, le=100),
+):
+    pattern = f"%{q.strip()}%"
+    sid = str(ctx["student_id"])
+    rows = fetch_all(
+        """
+        SELECT cc.id, cc.class_code, cc.class_name, cc.semester::text AS semester,
+               cc.school_year, cc.room,
+               s.subject_code, s.subject_name,
+               lec.full_name AS lecturer_name, lec.lecturer_code,
+               (SELECT COUNT(*) FROM course_class_students ccs
+                WHERE ccs.course_class_id = cc.id AND ccs.status = 'ACTIVE')::int AS student_count
+        FROM course_classes cc
+        JOIN subjects s ON s.id = cc.subject_id
+        JOIN lecturers lec ON lec.id = cc.lecturer_id
+        WHERE (
+            cc.class_code ILIKE %s OR cc.class_name ILIKE %s
+            OR s.subject_code ILIKE %s OR s.subject_name ILIKE %s
+            OR lec.full_name ILIKE %s OR lec.lecturer_code ILIKE %s
+            OR cc.school_year ILIKE %s OR cc.semester::text ILIKE %s
+        )
+        AND NOT EXISTS (
+            SELECT 1 FROM course_class_students ccs
+            WHERE ccs.course_class_id = cc.id
+              AND ccs.student_id = %s::uuid
+              AND ccs.status = 'ACTIVE'
+        )
+        AND NOT EXISTS (
+            SELECT 1 FROM course_class_join_requests r2
+            WHERE r2.course_class_id = cc.id
+              AND r2.student_id = %s::uuid
+              AND r2.status = 'PENDING'::request_status
+        )
+        ORDER BY cc.school_year DESC, cc.class_code
+        LIMIT %s
+        """,
+        (
+            pattern,
+            pattern,
+            pattern,
+            pattern,
+            pattern,
+            pattern,
+            pattern,
+            pattern,
+            sid,
+            sid,
+            limit,
+        ),
+    )
+    return rows_to_json_serializable(rows)
+
+
+@router.get("/course-class-join-requests")
+def student_list_course_class_join_requests(
+    ctx: Annotated[dict, Depends(get_student_context)],
+):
+    rows = fetch_all(
+        """
+        SELECT r.id, r.status::text AS status, r.message, r.lecturer_note,
+               r.created_at, r.processed_at,
+               cc.id AS course_class_id, cc.class_code, cc.class_name,
+               s.subject_code, s.subject_name
+        FROM course_class_join_requests r
+        JOIN course_classes cc ON cc.id = r.course_class_id
+        JOIN subjects s ON s.id = cc.subject_id
+        WHERE r.student_id = %s::uuid
+        ORDER BY r.created_at DESC
+        LIMIT 100
+        """,
+        (str(ctx["student_id"]),),
+    )
+    return rows_to_json_serializable(rows)
+
+
+@router.post("/course-class-join-requests")
+def student_create_course_class_join_request(
+    body: CreateCourseClassJoinRequestBody,
+    ctx: Annotated[dict, Depends(get_student_context)],
+):
+    cc = fetch_one(
+        "SELECT id FROM course_classes WHERE id = %s::uuid",
+        (str(body.course_class_id),),
+    )
+    if not cc:
+        raise HTTPException(status_code=404, detail="Không tìm thấy lớp học phần")
+
+    active = fetch_one(
+        """
+        SELECT 1 AS ok FROM course_class_students
+        WHERE course_class_id = %s::uuid AND student_id = %s::uuid AND status = 'ACTIVE'
+        """,
+        (str(body.course_class_id), str(ctx["student_id"])),
+    )
+    if active:
+        raise HTTPException(status_code=400, detail="Bạn đã là thành viên lớp này")
+
+    pending = fetch_one(
+        """
+        SELECT id FROM course_class_join_requests
+        WHERE course_class_id = %s::uuid AND student_id = %s::uuid
+          AND status = 'PENDING'::request_status
+        LIMIT 1
+        """,
+        (str(body.course_class_id), str(ctx["student_id"])),
+    )
+    if pending:
+        raise HTTPException(status_code=400, detail="Bạn đã có yêu cầu đang chờ duyệt cho lớp này")
+
+    msg = (body.message or "").strip() or None
+    row = execute_returning(
+        """
+        INSERT INTO course_class_join_requests (course_class_id, student_id, status, message)
+        VALUES (%s::uuid, %s::uuid, 'PENDING'::request_status, %s)
+        RETURNING id, status::text AS status, message, created_at
+        """,
+        (str(body.course_class_id), str(ctx["student_id"]), msg),
+    )
+    return rows_to_json_serializable([row])[0]
+
+
+@router.delete("/course-class-join-requests/{request_id}")
+def student_cancel_course_class_join_request(
+    request_id: UUID,
+    ctx: Annotated[dict, Depends(get_student_context)],
+):
+    row = execute_returning(
+        """
+        UPDATE course_class_join_requests
+        SET status = 'CANCELLED'::request_status,
+            updated_at = CURRENT_TIMESTAMP,
+            processed_at = CURRENT_TIMESTAMP
+        WHERE id = %s::uuid AND student_id = %s::uuid AND status = 'PENDING'::request_status
+        RETURNING id, status::text AS status
+        """,
+        (str(request_id), str(ctx["student_id"])),
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Không tìm thấy yêu cầu đang chờ để hủy")
     return rows_to_json_serializable([row])[0]

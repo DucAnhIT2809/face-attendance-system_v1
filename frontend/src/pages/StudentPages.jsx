@@ -272,6 +272,203 @@ export function StudentHistoryPage() {
   );
 }
 
+export function StudentJoinClassesPage() {
+  const [q, setQ] = useState("");
+  const [hits, setHits] = useState([]);
+  const [mine, setMine] = useState([]);
+  const [err, setErr] = useState("");
+  const [msg, setMsg] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [busyClass, setBusyClass] = useState("");
+
+  async function refreshMine() {
+    const data = await apiFetch("/api/student/course-class-join-requests");
+    setMine(data || []);
+  }
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const data = await apiFetch("/api/student/course-class-join-requests");
+        if (!cancelled) setMine(data || []);
+      } catch (e) {
+        if (!cancelled) setErr(e.message);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  async function search() {
+    setErr("");
+    setMsg("");
+    const term = q.trim();
+    if (term.length < 1) {
+      setErr("Nhập ít nhất một ký tự để tìm (mã lớp, mã học phần, tên môn, giảng viên…).");
+      return;
+    }
+    setLoading(true);
+    try {
+      const data = await apiFetch(
+        `/api/student/course-classes/search?q=${encodeURIComponent(term)}&limit=50`
+      );
+      setHits(data || []);
+      if (!(data || []).length) setMsg("Không có lớp phù hợp (hoặc bạn đã tham gia / đang chờ duyệt).");
+    } catch (e) {
+      setErr(e.message);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function requestJoin(courseClassId) {
+    const message = window.prompt("Lời nhắn cho giảng viên (tùy chọn, Enter để bỏ qua)") ?? "";
+    setBusyClass(String(courseClassId));
+    setErr("");
+    setMsg("");
+    try {
+      await apiFetch("/api/student/course-class-join-requests", {
+        method: "POST",
+        body: JSON.stringify({
+          course_class_id: courseClassId,
+          message: message.trim() || null
+        })
+      });
+      setMsg("Đã gửi yêu cầu tham gia lớp.");
+      setHits((prev) => prev.filter((h) => String(h.id) !== String(courseClassId)));
+      await refreshMine();
+    } catch (e) {
+      setErr(e.message);
+    } finally {
+      setBusyClass("");
+    }
+  }
+
+  async function cancelRequest(requestId) {
+    if (!window.confirm("Hủy yêu cầu tham gia lớp này?")) return;
+    setErr("");
+    setMsg("");
+    try {
+      await apiFetch(`/api/student/course-class-join-requests/${requestId}`, { method: "DELETE" });
+      setMsg("Đã hủy yêu cầu.");
+      await refreshMine();
+    } catch (e) {
+      setErr(e.message);
+    }
+  }
+
+  return (
+    <PageBlock title="Tham gia lớp học phần">
+      {err ? <p className="hint api-error">{err}</p> : null}
+      {msg ? <p className="hint password-success">{msg}</p> : null}
+      <p className="hint">
+        Tìm theo mã lớp, mã học phần, tên môn, tên/mã giảng viên, học kỳ hoặc năm học. Các lớp bạn đã tham gia hoặc
+        đang chờ duyệt sẽ không hiển thị trong kết quả.
+      </p>
+      <div className="actions join-search">
+        <input
+          placeholder="VD: INT1481, 13094, Lập trình Web…"
+          value={q}
+          onChange={(e) => setQ(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") search();
+          }}
+          aria-label="Từ khóa tìm lớp"
+        />
+        <button type="button" className="primary" disabled={loading} onClick={search}>
+          {loading ? "Đang tìm..." : "Tìm lớp"}
+        </button>
+      </div>
+
+      {hits.length ? (
+        <div className="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Mã lớp</th>
+                <th>Mã HP</th>
+                <th>Tên học phần</th>
+                <th>Học kỳ / năm</th>
+                <th>Giảng viên</th>
+                <th>Sĩ số</th>
+                <th />
+              </tr>
+            </thead>
+            <tbody>
+              {hits.map((h) => (
+                <tr key={h.id}>
+                  <td>{h.class_code}</td>
+                  <td>{h.subject_code}</td>
+                  <td>{h.subject_name}</td>
+                  <td>
+                    {h.semester} {h.school_year}
+                  </td>
+                  <td>
+                    {h.lecturer_name}
+                    <div className="hint">{h.lecturer_code}</div>
+                  </td>
+                  <td>{h.student_count}</td>
+                  <td>
+                    <button
+                      type="button"
+                      className="primary"
+                      disabled={busyClass === String(h.id)}
+                      onClick={() => requestJoin(h.id)}
+                    >
+                      Gửi yêu cầu
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : null}
+
+      <h4 className="subpanel-title">Yêu cầu của tôi</h4>
+      <div className="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Trạng thái</th>
+              <th>Lớp / môn</th>
+              <th>Lời nhắn</th>
+              <th>Phản hồi GV</th>
+              <th>Thời gian</th>
+              <th />
+            </tr>
+          </thead>
+          <tbody>
+            {mine.map((r) => (
+              <tr key={r.id}>
+                <td>{r.status}</td>
+                <td>
+                  {r.class_code} — {r.subject_name}
+                </td>
+                <td>{r.message ?? "—"}</td>
+                <td>{r.lecturer_note ?? "—"}</td>
+                <td className="hint">{String(r.created_at ?? "").slice(0, 19)}</td>
+                <td>
+                  {r.status === "PENDING" ? (
+                    <button type="button" onClick={() => cancelRequest(r.id)}>
+                      Hủy yêu cầu
+                    </button>
+                  ) : (
+                    "—"
+                  )}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      {!mine.length ? <p className="hint">Chưa có yêu cầu tham gia lớp.</p> : null}
+    </PageBlock>
+  );
+}
+
 export function StudentReviewPage() {
   const [sessions, setSessions] = useState([]);
   const [requests, setRequests] = useState([]);

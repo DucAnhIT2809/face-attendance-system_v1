@@ -3,7 +3,7 @@ from typing import Annotated, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.db import execute, execute_returning, fetch_all, fetch_one, rows_to_json_serializable
 from app.deps import get_lecturer_context
@@ -23,6 +23,23 @@ class UpdateSessionBody(BaseModel):
 class ProcessRecheckRequestBody(BaseModel):
     decision: str
     response: Optional[str] = None
+
+
+class CreateCourseClassBody(BaseModel):
+    class_code: str = Field(min_length=1, max_length=100)
+    class_name: Optional[str] = Field(None, max_length=255)
+    subject_code: str = Field(min_length=1, max_length=50)
+    subject_name: str = Field(min_length=1, max_length=255)
+    credits: int = Field(default=3, ge=0, le=30)
+    semester: str = Field(min_length=1, max_length=20)
+    school_year: str = Field(min_length=1, max_length=20)
+    room: Optional[str] = Field(None, max_length=100)
+    description: Optional[str] = None
+
+
+class CourseClassJoinDecisionBody(BaseModel):
+    decision: str
+    lecturer_note: Optional[str] = Field(None, max_length=500)
 
 
 @router.get("/me")
@@ -437,6 +454,119 @@ def attendance_results_filtered(
     return rows_to_json_serializable(rows)
 
 
+@router.get("/reports/attendance")
+def attendance_report(
+    ctx: Annotated[dict, Depends(get_lecturer_context)],
+    class_code: str = Query(..., description="Mã lớp học phần cần xuất báo cáo"),
+    from_date: Optional[str] = Query(None, description="Từ ngày YYYY-MM-DD"),
+    to_date: Optional[str] = Query(None, description="Đến ngày YYYY-MM-DD"),
+):
+    class_info = fetch_one(
+        """
+        SELECT cc.id, cc.class_code, cc.class_name, cc.semester::text AS semester,
+               cc.school_year, sub.subject_code, sub.subject_name,
+               (SELECT COUNT(*) FROM course_class_students ccs
+                WHERE ccs.course_class_id = cc.id AND ccs.status = 'ACTIVE')::int AS student_count
+        FROM course_classes cc
+        JOIN subjects sub ON sub.id = cc.subject_id
+        WHERE cc.lecturer_id = %s::uuid AND cc.class_code = %s
+        """,
+        (str(ctx["lecturer_id"]), class_code),
+    )
+    if not class_info:
+        raise HTTPException(status_code=404, detail="Không tìm thấy lớp học phần hoặc không có quyền")
+
+    filters = ["cs.course_class_id = %s::uuid"]
+    params: list = [str(class_info["id"])]
+    if from_date:
+        filters.append("cs.session_date >= %s::date")
+        params.append(from_date)
+    if to_date:
+        filters.append("cs.session_date <= %s::date")
+        params.append(to_date)
+    session_where = " AND ".join(filters)
+
+    rows = fetch_all(
+        f"""
+        WITH selected_sessions AS (
+            SELECT cs.id, cs.session_code, cs.session_date, cs.start_time, cs.end_time,
+                   cs.status::text AS session_status
+            FROM class_sessions cs
+            WHERE {session_where}
+        ),
+        active_students AS (
+            SELECT st.id, st.student_code, st.full_name, st.administrative_class
+            FROM course_class_students ccs
+            JOIN students st ON st.id = ccs.student_id
+            WHERE ccs.course_class_id = %s::uuid
+              AND ccs.status = 'ACTIVE'
+              AND st.status = 'ACTIVE'
+        )
+        SELECT ss.session_code, ss.session_date, ss.start_time, ss.end_time, ss.session_status,
+               ast.student_code, ast.full_name, ast.administrative_class,
+               COALESCE(ar.status::text, 'ABSENT') AS attendance_status,
+               ar.source::text AS source,
+               ar.check_in_time, ar.last_seen_at, ar.check_out_time,
+               ar.total_seen_seconds, ar.similarity_score, ar.recognition_confidence,
+               ar.note
+        FROM selected_sessions ss
+        CROSS JOIN active_students ast
+        LEFT JOIN attendance_records ar
+          ON ar.session_id = ss.id
+         AND ar.student_id = ast.id
+        ORDER BY ss.session_date DESC, ss.start_time DESC, ast.student_code
+        """,
+        tuple(params + [str(class_info["id"])]),
+    )
+
+    summary_rows = fetch_all(
+        f"""
+        WITH selected_sessions AS (
+            SELECT cs.id
+            FROM class_sessions cs
+            WHERE {session_where}
+        ),
+        active_students AS (
+            SELECT st.id
+            FROM course_class_students ccs
+            JOIN students st ON st.id = ccs.student_id
+            WHERE ccs.course_class_id = %s::uuid
+              AND ccs.status = 'ACTIVE'
+              AND st.status = 'ACTIVE'
+        ),
+        matrix AS (
+            SELECT COALESCE(ar.status::text, 'ABSENT') AS attendance_status
+            FROM selected_sessions ss
+            CROSS JOIN active_students ast
+            LEFT JOIN attendance_records ar
+              ON ar.session_id = ss.id
+             AND ar.student_id = ast.id
+        )
+        SELECT attendance_status, COUNT(*)::int AS count
+        FROM matrix
+        GROUP BY attendance_status
+        """,
+        tuple(params + [str(class_info["id"])]),
+    )
+
+    session_count = fetch_one(
+        f"SELECT COUNT(*)::int AS count FROM class_sessions cs WHERE {session_where}",
+        tuple(params),
+    )
+    summary = {
+        "session_count": session_count["count"] if session_count else 0,
+        "student_count": class_info["student_count"],
+        "total_rows": len(rows),
+        "by_status": {r["attendance_status"]: r["count"] for r in summary_rows},
+    }
+
+    return {
+        "class_info": rows_to_json_serializable([class_info])[0],
+        "summary": summary,
+        "rows": rows_to_json_serializable(rows),
+    }
+
+
 @router.get("/recheck-requests")
 def lecturer_recheck_requests(
     ctx: Annotated[dict, Depends(get_lecturer_context)],
@@ -547,3 +677,177 @@ def process_lecturer_recheck_request(
         ),
     )
     return rows_to_json_serializable([row])[0]
+
+
+_SEMESTERS = {"HK1", "HK2", "HK_HE"}
+
+
+@router.post("/course-classes")
+def create_course_class(
+    body: CreateCourseClassBody,
+    ctx: Annotated[dict, Depends(get_lecturer_context)],
+):
+    sem = body.semester.strip().upper()
+    if sem not in _SEMESTERS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Học kỳ không hợp lệ: chọn một trong {', '.join(sorted(_SEMESTERS))}",
+        )
+
+    dup = fetch_one(
+        """
+        SELECT id FROM course_classes
+        WHERE class_code = %s AND semester = %s::semester_type AND school_year = %s
+        """,
+        (body.class_code.strip(), sem, body.school_year.strip()),
+    )
+    if dup:
+        raise HTTPException(status_code=409, detail="Đã tồn tại lớp học phần với cùng mã lớp, học kỳ và năm học")
+
+    code = body.subject_code.strip()
+    sub = fetch_one(
+        "SELECT id FROM subjects WHERE UPPER(TRIM(subject_code)) = UPPER(TRIM(%s))",
+        (code,),
+    )
+    if not sub:
+        sub = execute_returning(
+            """
+            INSERT INTO subjects (subject_code, subject_name, credits)
+            VALUES (TRIM(%s), %s, %s)
+            RETURNING id
+            """,
+            (code, body.subject_name.strip(), body.credits),
+        )
+    if not sub:
+        raise HTTPException(status_code=500, detail="Không tạo được học phần")
+
+    cn = (body.class_name or "").strip() or None
+    row = execute_returning(
+        """
+        INSERT INTO course_classes (
+            class_code, class_name, subject_id, lecturer_id, semester, school_year, room, description
+        )
+        VALUES (
+            TRIM(%s), %s, %s::uuid, %s::uuid, %s::semester_type, TRIM(%s), %s, %s
+        )
+        RETURNING id, class_code, class_name, semester::text AS semester, school_year, room, description
+        """,
+        (
+            body.class_code,
+            cn,
+            str(sub["id"]),
+            str(ctx["lecturer_id"]),
+            sem,
+            body.school_year.strip(),
+            (body.room or "").strip() or None,
+            (body.description or "").strip() or None,
+        ),
+    )
+    if not row:
+        raise HTTPException(status_code=500, detail="Không tạo được lớp học phần")
+
+    meta = fetch_one(
+        """
+        SELECT s.subject_code, s.subject_name
+        FROM course_classes cc
+        JOIN subjects s ON s.id = cc.subject_id
+        WHERE cc.id = %s::uuid
+        """,
+        (str(row["id"]),),
+    )
+    row.update(meta or {})
+    return rows_to_json_serializable([row])[0]
+
+
+@router.get("/course-class-join-requests")
+def list_course_class_join_requests(
+    ctx: Annotated[dict, Depends(get_lecturer_context)],
+    status_filter: Optional[str] = Query(None, alias="status", description="PENDING, APPROVED, REJECTED, CANCELLED"),
+):
+    params: list = [str(ctx["lecturer_id"])]
+    extra = ""
+    if status_filter:
+        extra = " AND r.status::text = %s"
+        params.append(status_filter.strip().upper())
+
+    rows = fetch_all(
+        f"""
+        SELECT r.id, r.status::text AS status, r.message, r.lecturer_note,
+               r.created_at, r.processed_at,
+               cc.id AS course_class_id, cc.class_code, cc.class_name,
+               s.subject_code, s.subject_name,
+               st.id AS student_id, st.student_code, st.full_name, st.administrative_class
+        FROM course_class_join_requests r
+        JOIN course_classes cc ON cc.id = r.course_class_id
+        JOIN subjects s ON s.id = cc.subject_id
+        JOIN students st ON st.id = r.student_id
+        WHERE cc.lecturer_id = %s::uuid
+        {extra}
+        ORDER BY
+            CASE r.status::text
+                WHEN 'PENDING' THEN 0
+                WHEN 'APPROVED' THEN 1
+                WHEN 'REJECTED' THEN 2
+                ELSE 3
+            END,
+            r.created_at DESC
+        LIMIT 300
+        """,
+        tuple(params),
+    )
+    return rows_to_json_serializable(rows)
+
+
+@router.post("/course-class-join-requests/{request_id}/decision")
+def decide_course_class_join_request(
+    request_id: UUID,
+    body: CourseClassJoinDecisionBody,
+    ctx: Annotated[dict, Depends(get_lecturer_context)],
+):
+    decision = body.decision.strip().upper()
+    if decision not in {"APPROVED", "REJECTED"}:
+        raise HTTPException(status_code=400, detail="decision phải là APPROVED hoặc REJECTED")
+
+    req = fetch_one(
+        """
+        SELECT r.id, r.course_class_id, r.student_id, r.status::text AS status
+        FROM course_class_join_requests r
+        JOIN course_classes cc ON cc.id = r.course_class_id
+        WHERE r.id = %s::uuid AND cc.lecturer_id = %s::uuid
+        """,
+        (str(request_id), str(ctx["lecturer_id"])),
+    )
+    if not req:
+        raise HTTPException(status_code=404, detail="Không tìm thấy yêu cầu hoặc không có quyền")
+    if req["status"] != "PENDING":
+        raise HTTPException(status_code=400, detail="Yêu cầu này đã được xử lý")
+
+    note = (body.lecturer_note or "").strip() or None
+
+    if decision == "APPROVED":
+        execute(
+            """
+            INSERT INTO course_class_students (course_class_id, student_id, status, joined_at, removed_at)
+            VALUES (%s::uuid, %s::uuid, 'ACTIVE'::class_member_status, CURRENT_TIMESTAMP, NULL)
+            ON CONFLICT (course_class_id, student_id) DO UPDATE SET
+                status = 'ACTIVE'::class_member_status,
+                joined_at = CURRENT_TIMESTAMP,
+                removed_at = NULL
+            """,
+            (str(req["course_class_id"]), str(req["student_id"])),
+        )
+
+    row = execute_returning(
+        """
+        UPDATE course_class_join_requests
+        SET status = %s::request_status,
+            lecturer_note = %s,
+            processed_by = %s::uuid,
+            processed_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = %s::uuid
+        RETURNING id, status::text AS status, lecturer_note, processed_at
+        """,
+        (decision, note, str(ctx["id"]), str(request_id)),
+    )
+    return rows_to_json_serializable([row])[0] if row else {}
